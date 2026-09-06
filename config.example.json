@@ -1,0 +1,18 @@
+{
+  "poll_interval": 1.0,
+  "show_skins": true,
+  "show_peak_rank": true,
+  "respect_streamer_mode": true,
+  "track_encounters": true,
+  "fetch_performance": true,
+  "performance_matches": 5,
+  "performance_queue": "competitive",
+  "performance_queue_fallback": true,
+  "post_match_summary": true,
+  "rating_calibration": "auto",
+  "player_cache_minutes": 20,
+  "request_gap": 0.15,
+  "region": null,
+  "shard": null,
+  "client_version": null
+}

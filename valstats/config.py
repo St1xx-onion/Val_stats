@@ -71,6 +71,8 @@ def validate(raw, warn=print):
     if cfg["poll_interval"] < 0.2:
         warn("[config] poll_interval below 0.2s is pointless - raised to 0.2")
         cfg["poll_interval"] = 0.2
+    # It ends up in a URL, so it has to be a whole number.
+    cfg["performance_matches"] = int(cfg["performance_matches"])
     if cfg["performance_matches"] < 1:
         warn("[config] performance_matches must be at least 1 - using 1")
         cfg["performance_matches"] = 1

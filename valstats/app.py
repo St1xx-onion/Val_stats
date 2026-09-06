@@ -208,7 +208,7 @@ class App:
                 break
             self.view.update(
                 show_perf=True,
-                status=f"last {count} comp matches - {done}/{len(targets)} players",
+                status=f"last {count} matches - {done}/{len(targets)} players",
             )
 
         if fetcher.unavailable:
@@ -217,7 +217,7 @@ class App:
             return
         if not any(r.acs is not None for r in targets):
             self.view.update(status="")
-            render.warn("no recent competitive matches found for this lobby")
+            render.warn("no recent matches found for anyone in this lobby")
             return
 
         scale = (

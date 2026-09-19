@@ -48,10 +48,12 @@
   "pool_trust": "confirmed",
   "pool_refresh_hours": 12.0,
   "check_updates": true,
-  "update_repo": "",
+  "update_repo": "St1xx-onion/Val_stats",
   "auto_update": false,
   "update_check_hours": 24.0,
   "request_gap": 0.15,
+  "request_gap_floor": 0.08,
+  "adaptive_pace": true,
   "region": null,
   "shard": null,
   "client_version": null

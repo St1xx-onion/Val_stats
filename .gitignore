@@ -10,3 +10,5 @@ errors.log
 run.zip
 dist/
 .backup/
+*.zip
+*.zip.bak

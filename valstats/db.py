@@ -12,6 +12,7 @@ and `top` commands, and the population the 0-1000 score calibrates against.
 """
 
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -278,10 +279,68 @@ class Encounters:
         # somewhere else - a test, a dry run - cannot still open the real file.
         self.enabled = enabled
         self.conn = None
+        # How many batch() blocks deep we are. Above zero, the store methods
+        # stop committing and leave it to the outermost block - see batch().
+        self._batched = 0
         if enabled:
             self.conn = sqlite3.connect(path or DB_PATH)
+            self._tune()
             self._migrate()
             self.conn.executescript(SCHEMA)
+            self.conn.commit()
+
+    def _tune(self):
+        """Stop every commit costing a disk seek.
+
+        The default journal is a rollback file and the default synchronous is
+        FULL, which together mean each commit waits for two fsyncs. On a hard
+        disk that is around a tenth of a second, and the deep sweep commits
+        four times per match - so a three hundred match sweep spent two
+        minutes of its life waiting for the platter rather than for Riot.
+
+        WAL with synchronous=NORMAL costs one append and no wait. What is
+        given up is narrow and worth naming: a power cut or a kernel panic in
+        the wrong millisecond can lose the last transactions. Every one of
+        them is a match Riot will hand over again for free, so the trade is
+        several minutes per sweep against re-downloading a match that a crash
+        interrupted. WAL also lets a reader run while a write is in flight,
+        which is what makes the sweep's writer thread invisible to everything
+        else in the process.
+        """
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            # A database on a filesystem that will not do WAL - a network
+            # share is the usual one - keeps the old settings and the old
+            # speed. Nothing here needs WAL to be correct.
+            pass
+
+    @contextmanager
+    def batch(self):
+        """Hold the commits until the block ends, then make one.
+
+        The store methods each commit, which is right when something calls one
+        of them on its own and wrong when a caller is about to call four in a
+        row about the same match. Nesting is allowed and only the outermost
+        block commits.
+
+        On the way out the commit happens whether or not the block raised: a
+        half-written match is not a corrupt one here - every table is keyed by
+        match id and written with INSERT OR REPLACE, so the next sweep to see
+        that match fills in whatever is missing.
+        """
+        self._batched += 1
+        try:
+            yield self
+        finally:
+            self._batched -= 1
+            if not self._batched and self.conn:
+                self.conn.commit()
+
+    def _commit(self):
+        """A commit, unless a batch() block has taken charge of them."""
+        if self.conn and not self._batched:
             self.conn.commit()
 
     def _migrate(self):
@@ -407,7 +466,7 @@ class Encounters:
                 (puuid, match_id, now, int(tier)),
             )
             stored += cur.rowcount or 0
-        self.conn.commit()
+        self._commit()
         return stored
 
     def nameless(self, limit=200):
@@ -791,7 +850,7 @@ class Encounters:
             ],
         )
         self.conn.execute("INSERT OR IGNORE INTO parsed_matches (match_id) VALUES (?)", (match_id,))
-        self.conn.commit()
+        self._commit()
 
     def store_match_meta(self, match_id, meta):
         """Map, queue and start time of a match we already downloaded.
@@ -814,7 +873,7 @@ class Encounters:
                 meta.get("score") or "",
             ),
         )
-        self.conn.commit()
+        self._commit()
 
     # ------------------------------------------------ matches still unpublished
 
@@ -1492,7 +1551,7 @@ class Encounters:
                 for puuid, row in per_player.items()
             ],
         )
-        self.conn.commit()
+        self._commit()
 
     def conduct_for(self, puuid, limit=30):
         """One player's cached conduct rows, newest match first."""
@@ -1566,7 +1625,7 @@ class Encounters:
             f"VALUES (?, ?, ?, {marks})",
             rows,
         )
-        self.conn.commit()
+        self._commit()
 
     def rr_updates_for(self, puuid, limit=30):
         """One player's RR history, newest first, in the shape mmr.read wants."""

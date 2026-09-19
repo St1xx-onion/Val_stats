@@ -167,16 +167,28 @@ DEFAULTS = {
     # a day at most, and never during a match. An update replaces code only -
     # config.json, encounters.db and cache/ are never written by it.
     "check_updates": True,
-    # "owner/repo" to check. Empty turns the whole thing off, which is what a
-    # copy that was not handed out from GitHub wants.
-    "update_repo": "",
+    # "owner/repo" to check. This has to ship with a value in it: the program
+    # is handed out as a zip, and a zip that arrives with nowhere to look
+    # never asks about an update - which is the one thing the whole feature
+    # exists to do. Empty turns it off, for a copy that was not handed out
+    # from GitHub and should not be reaching for it.
+    "update_repo": "St1xx-onion/Val_stats",
     # Install without asking. Off, because saying yes should be somebody's
     # decision rather than a default they never saw.
     "auto_update": False,
     # How often to look, in hours.
     "update_check_hours": 24.0,
-    # Minimum gap between two outbound requests, in seconds.
+    # Minimum gap between two outbound requests, in seconds. The starting
+    # point now rather than the rule: the pacer narrows it while Riot is not
+    # complaining and widens it when it is.
     "request_gap": 0.15,
+    # How far the pacer is allowed to narrow that gap. This is the ceiling on
+    # the whole program's request rate - 0.08 is twelve a second, shared by
+    # every thread - and it is the number to raise if a sweep is still too
+    # slow, or lower if you would rather be gentler than the default.
+    "request_gap_floor": 0.08,
+    # Let the pacer move the gap at all. Off pins it to request_gap.
+    "adaptive_pace": True,
     # Leave null to auto-detect from ShooterGame.log
     "region": None,
     "shard": None,

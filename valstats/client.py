@@ -17,6 +17,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -44,6 +45,12 @@ CLIENT_PLATFORM = base64.b64encode(
 
 GLZ_RE = re.compile(r"https?://glz-([a-z0-9-]+?)-1\.([a-z0-9]+?)\.a\.pvp\.net")
 VERSION_RE = re.compile(r"CI server version:\s*(\S+)")
+
+# The most requests this program will ever have in flight at once. Not a
+# limit Riot publishes - it is the point past which the connection pool and
+# the pacer stop being the thing deciding the pace, and a number small enough
+# that a background sweep never looks like an attack from the far end.
+MAX_PARALLEL = 6
 
 # How long a fallback state probe stays good for, in seconds.
 PROBE_INTERVAL = 5.0
@@ -160,21 +167,88 @@ def _json(response):
 
 
 class Pacer:
-    """One shared throttle for every outbound request."""
+    """One shared throttle for every outbound request, across every thread.
 
-    def __init__(self, gap=0.15):
+    Two jobs, and they used to be one. The first is spacing: requests leave
+    `gap` seconds apart, whoever asked for them. The second is finding out
+    what `gap` should be, which the old fixed number could not do.
+
+    A fixed gap is a guess about a limit nobody publishes, and it is wrong in
+    both directions at once - too slow all evening, because it is set for the
+    worst case, and still too fast during the one minute Riot is unhappy. So
+    the gap moves: every `EASE_AFTER` requests that came back clean it shrinks
+    a step towards `floor`, and a 429 widens it hard and holds everything off
+    for as long as Riot asked. Additive ease, multiplicative back-off - the
+    same shape TCP uses, for the same reason.
+
+    Thread safety is the other half. The sweep now has several requests in
+    flight, and `_next_at` read-modify-written from four threads hands the
+    same slot to all four. Every field here is touched under `_lock`, and the
+    sleep happens outside it so that waiting for a slot does not stop anybody
+    else claiming the next one.
+    """
+
+    # The gap is never allowed below this, whatever the evening looks like.
+    #
+    # This is the one number here that is a judgement rather than a
+    # measurement, so it is worth saying what it is a judgement about. The
+    # pacer spaces *every* thread, so this is a ceiling on the whole program:
+    # 0.08 is twelve requests a second. The old standing gap was 0.15 and the
+    # sweep added 0.35 on top, which came to about two a second - so this is
+    # roughly six times the old pace, and nowhere near the pace that would
+    # make a private API interesting to whoever watches it.
+    #
+    # It is deliberately not as low as the connection would allow. The sweep
+    # backs off hard when Riot complains, but the cost of guessing too high
+    # on somebody's main account is not a slow report, and that asymmetry is
+    # what picks the number. Raise it with request_gap_floor if you disagree.
+    FLOOR = 0.08
+
+    # ...nor above this, or a single 429 at a bad moment stalls the sweep.
+    CEILING = 2.0
+
+    # Clean requests before the gap eases one step, and the size of the step.
+    EASE_AFTER = 20
+    EASE_STEP = 0.8
+
+    # What a 429 does to the gap.
+    WIDEN = 2.0
+
+    def __init__(self, gap=0.15, floor=FLOOR, adaptive=True):
         self.gap = max(0.0, float(gap))
+        self.floor = max(0.0, float(floor))
+        self.adaptive = bool(adaptive)
         self._next_at = 0.0
+        self._clean = 0
+        self._lock = threading.Lock()
 
     def wait(self):
-        now = time.monotonic()
-        if now < self._next_at:
-            time.sleep(self._next_at - now)
-        self._next_at = max(now, self._next_at) + self.gap
+        with self._lock:
+            now = time.monotonic()
+            due = max(now, self._next_at)
+            self._next_at = due + self.gap
+        delay = due - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+    def clean(self):
+        """One request Riot did not complain about. Eases the gap, slowly."""
+        if not self.adaptive:
+            return
+        with self._lock:
+            self._clean += 1
+            if self._clean < self.EASE_AFTER:
+                return
+            self._clean = 0
+            self.gap = max(self.floor, self.gap * self.EASE_STEP)
 
     def penalise(self, seconds):
         """Push everything back - a 429 is about the account, not one call."""
-        self._next_at = max(self._next_at, time.monotonic() + seconds)
+        with self._lock:
+            self._next_at = max(self._next_at, time.monotonic() + seconds)
+            if self.adaptive:
+                self._clean = 0
+                self.gap = min(self.CEILING, max(self.floor, self.gap * self.WIDEN))
 
 
 class ClientUnavailable(RuntimeError):
@@ -186,6 +260,14 @@ class Client:
         self.config = config
         self.session = requests.Session()
         self.session.verify = False
+        # The sweep runs several requests at once now. urllib3's default pool
+        # holds ten connections per host and quietly drops the surplus, which
+        # would turn every extra worker into a fresh TLS handshake against
+        # pd - the one cost a keep-alive session exists to avoid.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=MAX_PARALLEL * 2, pool_block=False
+        )
+        self.session.mount("https://", adapter)
         self.local_port = None
         self.local_auth = None
         self.puuid = None
@@ -194,9 +276,17 @@ class Client:
         self.region = config.get("region")
         self.shard = config.get("shard")
         self.client_version = config.get("client_version")
-        self.pacer = Pacer(config.get("request_gap", 0.15))
+        self.pacer = Pacer(
+            config.get("request_gap", 0.15),
+            floor=config.get("request_gap_floor", Pacer.FLOOR),
+            adaptive=config.get("adaptive_pace", True),
+        )
         self.requests_made = 0
         self.rate_limited = 0
+        # Guards the memo and the counters; `_token_lock` guards a refresh, so
+        # that ten threads meeting the same expired token cost one new one.
+        self._lock = threading.Lock()
+        self._token_lock = threading.Lock()
         self.menus_verify = max(0.0, float(config.get("menus_verify", MENUS_VERIFY)))
         self._probe_at = 0.0
         self._probe_result = None
@@ -254,6 +344,20 @@ class Client:
         self.puuid = ent["subject"]
         self._tokens_at = time.monotonic()
 
+    def _refresh_tokens(self, seen_at):
+        """Pull new tokens, unless another thread already did it for us.
+
+        Several requests in flight means several 401s arriving together, and
+        each one used to re-read the lockfile and fetch a fresh token. The
+        caller passes the token generation it was using; if that is no longer
+        the current one, somebody else has already replaced it and the caller
+        only has to try again.
+        """
+        with self._token_lock:
+            if self._tokens_at != seen_at:
+                return
+            self._read_tokens()
+
     def keep_fresh(self):
         """Re-read the tokens before they age out, rather than after.
 
@@ -263,7 +367,10 @@ class Client:
         """
         if self._tokens_at and time.monotonic() - self._tokens_at < TOKEN_TTL:
             return False
-        self._read_tokens()
+        with self._token_lock:
+            if self._tokens_at and time.monotonic() - self._tokens_at < TOKEN_TTL:
+                return False
+            self._read_tokens()
         return True
 
     def _detect_region(self):
@@ -357,21 +464,23 @@ class Client:
     # ------------------------------------------------------------------- memo
 
     def _memo_get(self, key):
-        entry = self._memo.get(key)
-        if entry is None:
-            return _MISS
-        expires, value = entry
-        if time.monotonic() >= expires:
-            del self._memo[key]
-            return _MISS
-        return value
+        with self._lock:
+            entry = self._memo.get(key)
+            if entry is None:
+                return _MISS
+            expires, value = entry
+            if time.monotonic() >= expires:
+                del self._memo[key]
+                return _MISS
+            return value
 
     def _memo_set(self, key, value):
         if self._memo_ttl <= 0:
             return
-        if len(self._memo) >= MAX_MEMO:
-            self._prune_memo()
-        self._memo[key] = (time.monotonic() + self._memo_ttl, value)
+        with self._lock:
+            if len(self._memo) >= MAX_MEMO:
+                self._prune_memo()
+            self._memo[key] = (time.monotonic() + self._memo_ttl, value)
 
     def _prune_memo(self):
         """Expired entries are only dropped when read, and this runs for days."""
@@ -384,8 +493,9 @@ class Client:
 
     def forget(self, *keys):
         """Drop memoised answers - used when we need a genuinely fresh one."""
-        for key in keys:
-            self._memo.pop(key, None)
+        with self._lock:
+            for key in keys:
+                self._memo.pop(key, None)
 
     # ---------------------------------------------------------------- request
 
@@ -434,15 +544,22 @@ class Client:
         attempt = 0
         while attempt < RETRIES:
             self.pacer.wait()
-            self.requests_made += 1
+            with self._lock:
+                self.requests_made += 1
+            # Read once, outside the request: if this call comes back 401 the
+            # tokens may already have been replaced by another thread, and
+            # this is how that is told apart from tokens that are really gone.
+            seen_at = self._tokens_at
             resp = self.session.request(method, url, headers=self._headers(), timeout=15, **kwargs)
 
             if resp.status_code == 429:
-                self.rate_limited += 1
+                with self._lock:
+                    self.rate_limited += 1
                 self.pacer.penalise(retry_delay(resp, attempt))
                 attempt += 1
                 continue
             if resp.status_code == 404:
+                self.pacer.clean()
                 return None
             if resp.status_code == 400:
                 # This is what a VALORANT update looks like from down here: the
@@ -465,13 +582,14 @@ class Client:
                 if refreshed:
                     raise ClientUnavailable("tokens were refused even after a refresh")
                 refreshed = True
-                self._read_tokens()
+                self._refresh_tokens(seen_at)
                 continue
             if resp.status_code >= 500 and attempt < RETRIES - 1:
                 self.pacer.penalise(min(MAX_BACKOFF, 1.0 * (2**attempt)))
                 attempt += 1
                 continue
             resp.raise_for_status()
+            self.pacer.clean()
             return _json(resp)
 
         resp.raise_for_status()  # out of retries: let the caller see the 429

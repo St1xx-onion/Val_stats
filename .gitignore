@@ -12,3 +12,5 @@ dist/
 .backup/
 *.zip
 *.zip.bak
+encounters.db-wal
+encounters.db-shm

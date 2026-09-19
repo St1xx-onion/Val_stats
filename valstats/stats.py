@@ -8,8 +8,31 @@ class PlayerRow:
     puuid: str
     team: str = ""
     agent: str = "-"
+    agent_id: str = ""
     name: str = ""
     hidden: bool = False
+    # Hidden while the match was live, named afterwards from the match record.
+    revealed: bool = False
+    # Which of identity.py's sources put this name to this puuid, and - for a
+    # source that answers about a moment rather than about today - when that
+    # moment was. A dated name is printed as the weaker claim it is: it is who
+    # the puuid belonged to then, which is not quite the same as who is here.
+    name_source: str = ""
+    name_when: str = ""
+    # Set when the rank below is the last one we ever saw them at rather than
+    # one read for this lobby: the date of that match. See db.last_ranks.
+    tier_seen: str = ""
+    # Set when the rank came out of the record of the match just finished.
+    rank_revealed: bool = False
+    # Set when their own match records were read and none of them carries a
+    # competitive rank. That is an answer - "this account has never been
+    # ranked" - and a different one from the empty cell of somebody nobody was
+    # allowed to ask about, so the table prints the two differently.
+    unranked: bool = False
+    # Set once an MMR lookup has actually been made for this player. False for
+    # anyone the live table was not allowed to ask about, which is what tells
+    # the post-match reveal who is still missing a rank and a peak.
+    mmr_read: bool = False
     level: int = 0
     tier: int = 0
     rr: int = 0
@@ -20,6 +43,14 @@ class PlayerRow:
     knife: str = "-"
     seen_before: int = 0
     is_self: bool = False
+    # Group letter when this player looks to have queued with someone else in
+    # the lobby. Worked out locally from the match cache - see party.py.
+    party: str = ""
+    # Where the ranked system looks to be walking them, worked out from the RR
+    # their own matches paid - see mmr.py. None for anyone with too little
+    # ranked history to read, which is most of a fresh cache.
+    mmr_band: object = None
+    mmr_text: str = ""
     # Recent-form numbers, filled in from match-details when enabled.
     acs: float = None
     hs: float = None
@@ -29,6 +60,9 @@ class PlayerRow:
     rating: int = None
     perf_matches: int = 0
     perf_rounds: int = 0
+    # What has changed since we last met this player - see progress.py. None
+    # for somebody we have never seen, and for yourself.
+    progress: object = None
     # Numbers from the single match that just finished, for the summary table.
     final: dict = None
     notes: list = field(default_factory=list)
@@ -156,7 +190,8 @@ def rows_from_coregame(match, content):
 def _row_from_player(player, team_id, content):
     identity = player.get("PlayerIdentity") or {}
     row = PlayerRow(puuid=player.get("Subject", ""), team=team_id)
-    row.agent = content.agent(player.get("CharacterID"))
+    row.agent_id = (player.get("CharacterID") or "").lower()
+    row.agent = content.agent(row.agent_id)
     row.hidden = bool(identity.get("Incognito"))
     if not identity.get("HideAccountLevel"):
         row.level = identity.get("AccountLevel") or 0

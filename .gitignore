@@ -6,3 +6,7 @@ config.json
 encounters.db
 cache/
 out.txt
+errors.log
+run.zip
+dist/
+.backup/

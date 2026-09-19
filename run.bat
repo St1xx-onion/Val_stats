@@ -2,6 +2,9 @@
 setlocal enabledelayedexpansion
 title Valorant Stats
 chcp 65001 >nul
+rem Riot IDs come in every script there is; keep Python's output UTF-8 too.
+set "PYTHONIOENCODING=utf-8"
+set "PYTHONUTF8=1"
 cd /d "%~dp0"
 
 rem ---------------------------------------------------------------- find python
@@ -36,10 +39,20 @@ if /i "%~1"=="test"  goto :selftest
 if /i "%~1"=="check" goto :offlinetests
 if /i "%~1"=="reset" goto :reset
 if /i "%~1"=="who"         goto :passthrough
+if /i "%~1"=="mates"       goto :passthrough
+if /i "%~1"=="with"        goto :passthrough
+if /i "%~1"=="identify"    goto :passthrough
+if /i "%~1"=="id"          goto :passthrough
+if /i "%~1"=="match"       goto :passthrough
 if /i "%~1"=="top"         goto :passthrough
 if /i "%~1"=="backfill"    goto :passthrough
+if /i "%~1"=="agents"      goto :passthrough
 if /i "%~1"=="calibration" goto :passthrough
 if /i "%~1"=="calib"       goto :passthrough
+if /i "%~1"=="share"       goto :passthrough
+if /i "%~1"=="pool"        goto :passthrough
+if /i "%~1"=="update"      goto :passthrough
+if /i "%~1"=="upgrade"     goto :passthrough
 if not "%~1"=="" goto :usage
 
 "%VENV%" -m valstats
@@ -102,9 +115,16 @@ echo   run.bat check         run the offline parsing tests
 echo   run.bat reset         clear the local match memory and content cache
 echo.
 echo   run.bat who ^<name^>    what the local memory knows about a player
+echo   run.bat mates ^<name^>  who that player keeps queueing with
+echo   run.bat identify      name the players who hid behind streamer mode
+echo   run.bat match ^<M12^>   the Riot match id behind a local match number
 echo   run.bat top [n]       the people you run into most often
 echo   run.bat backfill [n]  parse your own recent matches into the cache
+echo   run.bat agents [n]    your own agent pool, as the pick advice sees it
 echo   run.bat calibration   what the 0-1000 score is measured against
+echo   run.bat share         the shared match pool: status, "share now" to send
+echo   run.bat pool          the downloaded pool: status, "pool sync" to fetch
+echo   run.bat update        check GitHub for a newer version and install it
 goto :done
 
 :done

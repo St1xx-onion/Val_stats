@@ -43,17 +43,33 @@ def _tier_label(tier):
     return f"{short} {number}".strip()
 
 
+def _cached(cache):
+    try:
+        return json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _get(endpoint, params=None):
     CACHE_DIR.mkdir(exist_ok=True)
     cache = CACHE_DIR / (endpoint.replace("/", "_") + ".json")
-    if cache.is_file() and time.time() - cache.stat().st_mtime < CACHE_TTL:
-        try:
-            return json.loads(cache.read_text(encoding="utf-8"))
-        except ValueError:
-            pass
-    resp = requests.get(f"{BASE}/{endpoint}", params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()["data"]
+    fresh = cache.is_file() and time.time() - cache.stat().st_mtime < CACHE_TTL
+    if fresh:
+        data = _cached(cache)
+        if data is not None:
+            return data
+    try:
+        resp = requests.get(f"{BASE}/{endpoint}", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+    except (requests.RequestException, ValueError, KeyError):
+        # Agent names and rank labels do not change between patches, so a day
+        # old copy is a far better answer than an exception. This is what lets
+        # the offline commands stay offline when the machine is.
+        stale = _cached(cache) if cache.is_file() else None
+        if stale is None:
+            raise
+        return stale
     cache.write_text(json.dumps(data), encoding="utf-8")
     return data
 
@@ -61,12 +77,15 @@ def _get(endpoint, params=None):
 class Content:
     def __init__(self):
         self.agents = {}
+        self.roles = {}
+        self.maps = {}
         self.tiers = {}
         self.skins = {}
         self.current_act = None
 
     def load(self, want_skins=True):
         self._load_agents()
+        self._load_maps()
         self._load_tiers()
         self._load_acts()
         if want_skins:
@@ -75,7 +94,21 @@ class Content:
 
     def _load_agents(self):
         for agent in _get("agents", {"isPlayableCharacter": "true"}):
-            self.agents[agent["uuid"].lower()] = agent["displayName"]
+            uuid = agent["uuid"].lower()
+            self.agents[uuid] = agent["displayName"]
+            # Roles come straight from Riot's own data, so a new agent lands in
+            # the right bucket without anyone editing a table here.
+            self.roles[uuid] = ((agent.get("role") or {}).get("displayName") or "").strip()
+
+    def _load_maps(self):
+        """Both keys: pregame sends the map path, other payloads send the uuid."""
+        for game_map in _get("maps"):
+            name = game_map.get("displayName") or ""
+            if not name:
+                continue
+            for key in (game_map.get("uuid"), game_map.get("mapUrl")):
+                if key:
+                    self.maps[key.lower()] = name
 
     def _load_tiers(self):
         episodes = _get("competitivetiers")
@@ -110,6 +143,17 @@ class Content:
         if not uuid:
             return "-"
         return self.agents.get(uuid.lower(), "?")
+
+    def role(self, uuid):
+        """"Controller" / "Duelist" / "Initiator" / "Sentinel", or "" if unknown."""
+        if not uuid:
+            return ""
+        return self.roles.get(uuid.lower(), "")
+
+    def map_name(self, map_id):
+        if not map_id:
+            return ""
+        return self.maps.get(str(map_id).lower(), "")
 
     def tier(self, number):
         return self.tiers.get(number or 0, UNRANKED)

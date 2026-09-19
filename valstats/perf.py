@@ -15,6 +15,7 @@ Two things keep the 0-1000 score honest:
 import bisect
 import json
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -56,19 +57,26 @@ BLANK = {
     "dmg_dealt": 0,
     "dmg_received": 0,
     "won": 0,
+    "agent": "",
+    "team": "",
+    "party": "",
 }
 
 
 def extract(details):
     """match_id, {puuid: line} for every player in one match-details payload.
 
-    Deliberately reads only `subject` and the stat blocks. The payload also
-    carries gameName/tagLine for every player, including ones hiding behind
-    streamer mode - we never touch those fields.
+    Deliberately reads only `subject`, the side, the agent and the stat blocks.
+    The payload also carries gameName/tagLine for every player, including ones
+    hiding behind streamer mode - nothing here reads those fields. Naming a
+    player from a finished match is a separate, deliberate step: see names().
+    Neither an agent nor a side is an identity: the live table shows both
+    anyway, straight from the lobby. Which side each player was on is what lets
+    party detection tell
+    "queued together" apart from "happened to be in the same match".
     """
     match_id = (details.get("matchInfo") or {}).get("matchId") or ""
     per_player = {}
-    team_of = {}
 
     for player in details.get("players") or []:
         subject = player.get("subject")
@@ -80,18 +88,109 @@ def extract(details):
             kills=stats.get("kills") or 0,
             deaths=stats.get("deaths") or 0,
             assists=stats.get("assists") or 0,
+            agent=(player.get("characterId") or "").lower(),
+            team=player.get("teamId") or "",
+            # Riot hands out the party every player queued in - for all ten of
+            # them, not just yours. The live lobby does not carry it, which is
+            # why party.py has to infer; the record of a finished match does,
+            # which is what turns that inference into a fact after the event.
+            party=player.get("partyId") or "",
         )
         per_player[subject] = line
-        team_of[subject] = player.get("teamId")
 
     winners = {team.get("teamId") for team in details.get("teams") or [] if team.get("won")}
-    for subject, line in per_player.items():
-        line["won"] = 1 if team_of.get(subject) in winners else 0
+    for line in per_player.values():
+        line["won"] = 1 if line["team"] and line["team"] in winners else 0
 
     for round_result in details.get("roundResults") or []:
         _apply_round(round_result, per_player)
 
     return match_id, per_player
+
+
+def names(details):
+    """puuid -> "Name#Tag" from a finished match, for whoever it still names.
+
+    Riot used to leave gameName/tagLine in the record of every match, which is
+    where the post-match scoreboard took its names from. They no longer do: as
+    of this writing every player in a match-details payload comes back with
+    both fields empty, including you. This is kept because it costs nothing and
+    the day they put them back it starts working again - but the reveal does
+    not rely on it any more. What it relies on is the name service, which
+    blanks a player only while you are in a match with them and answers
+    normally once it is over. See App._reveal.
+
+    extract() still refuses to touch these fields whatever they hold: naming a
+    player is a separate, deliberate step.
+    """
+    out = {}
+    for player in details.get("players") or []:
+        subject = player.get("subject")
+        game_name = (player.get("gameName") or "").strip()
+        tag = (player.get("tagLine") or "").strip()
+        if not subject or not game_name:
+            continue
+        out[subject] = f"{game_name}#{tag}" if tag else game_name
+    return out
+
+
+def tiers(details):
+    """puuid -> competitive tier, for everyone in a finished match.
+
+    The record of a match carries the rank each player was at when they played
+    it, Incognito or not - this is the badge the tracker sites put next to
+    someone who spent the whole game showing up as [hidden]. Unlike a Riot ID
+    it is not an identity: it says how good they were that evening, not who
+    they are. Tier 0 means unranked or unplaced and is left out, so that a
+    player we know nothing about is not recorded as knowing them to be bronze.
+    """
+    out = {}
+    for player in details.get("players") or []:
+        subject = player.get("subject")
+        try:
+            tier = int(player.get("competitiveTier") or 0)
+        except (TypeError, ValueError):
+            continue
+        if subject and tier > 0:
+            out[subject] = tier
+    return out
+
+
+def meta(details):
+    """Map, queue and start time of one match, for the local cache.
+
+    Same rule as extract(): nothing here identifies a player. Knowing the map
+    is what lets the pick advice weigh how you actually do on it.
+    """
+    info = details.get("matchInfo") or {}
+    millis = info.get("gameStartMillis") or 0
+    started_at = None
+    if millis:
+        try:
+            started_at = datetime.fromtimestamp(millis / 1000, timezone.utc).isoformat(
+                timespec="seconds"
+            )
+        except (OverflowError, OSError, ValueError):
+            started_at = None
+    return {
+        "map_id": (info.get("mapId") or "").lower(),
+        # Riot spells this queueID here and queue elsewhere; accept both.
+        "queue": info.get("queueID") or info.get("queueId") or "",
+        "started_at": started_at,
+        # How long it ran, in seconds. Free here, and the one thing that tells
+        # a real match from a five-minute surrender in a pooled dataset.
+        "length": int((info.get("gameLengthMillis") or 0) / 1000) or 0,
+        # The final score, "Blue:13,Red:9". Kept as text because a team id is
+        # whatever Riot says it is - Blue and Red in competitive, something
+        # else in the modes nobody here scores.
+        "score": _score(details),
+    }
+
+
+def _score(details):
+    """Rounds won per side as flat text, in team-id order."""
+    got = outcome(details)["rounds"]
+    return ",".join(f"{team}:{int(won)}" for team, won in sorted(got.items()) if team)
 
 
 def outcome(details):
@@ -186,6 +285,23 @@ def aggregate(lines, calibration=None):
         return None
     summary["rating"] = rating(summary, calibration)
     return summary
+
+
+def by_agent(lines, calibration=None, map_id=None):
+    """agent uuid -> aggregate over the cached lines played on that agent.
+
+    Lines cached before agents were recorded carry no agent and drop out; the
+    same goes for every line from another map when `map_id` is given.
+    """
+    buckets = {}
+    for line in lines:
+        agent = (line.get("agent") or "").lower()
+        if not agent:
+            continue
+        if map_id and (line.get("map_id") or "").lower() != map_id.lower():
+            continue
+        buckets.setdefault(agent, []).append(line)
+    return {agent: aggregate(rows, calibration) for agent, rows in buckets.items()}
 
 
 # ------------------------------------------------------------------- scoring
@@ -379,6 +495,14 @@ class PerformanceFetcher:
                 continue
             parsed_id, per_player = extract(details)
             self.db.store_match_perf(parsed_id or match_id, per_player)
+            self.db.store_match_meta(parsed_id or match_id, meta(details))
+            # The rank every player in it was at, out of a payload already in
+            # hand and already paid for. Free here, and it is what a lobby
+            # weeks from now reads instead of going and asking: see
+            # app._rank_hidden, which is the whole reason somebody behind
+            # [hidden] has a rank at all. The deep sweep has kept these for a
+            # while; the five-match fetch was throwing them away.
+            self.db.store_rank_snapshots(parsed_id or match_id, tiers(details))
 
         return aggregate(self.db.perf_rows(puuid, match_ids), self.calibration)
 
